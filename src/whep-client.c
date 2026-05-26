@@ -15,11 +15,15 @@
 #include <string.h>
 #include <inttypes.h>
 
+/* X11 (for screen size detection) */
+#include <X11/Xlib.h>
+
 /* GStreamer */
 #include <gst/gst.h>
 #include <gst/sdp/sdp.h>
 #define GST_USE_UNSTABLE_API
 #include <gst/webrtc/webrtc.h>
+#include <gst/video/video.h>
 
 /* HTTP stack (WHEP API) */
 #include <libsoup/soup.h>
@@ -52,11 +56,17 @@ static GMainLoop *loop = NULL;
 static GstElement *pipeline = NULL, *pc = NULL;
 static const char *audio_caps = NULL, *video_caps = NULL;
 static gboolean no_trickle = FALSE, gathering_done = FALSE,
-	follow_link = FALSE, force_turn = FALSE, no_decode = FALSE;
+	follow_link = FALSE, force_turn = FALSE, no_decode = FALSE,
+	fullscreen = FALSE;
 static const char *stun_server = NULL, **turn_server = NULL;
 static char *auto_stun_server = NULL, **auto_turn_server = NULL;
 static int latency = -1;
+static int reconnect_delay = 5;
 static gboolean server_sent_offer = FALSE;
+
+/* Fullscreen state (used by whep_bus_watch and whep_reconnect) */
+static gboolean whep_fullscreen_requested = FALSE;
+static GstElement *whep_video_sink_ref = NULL;
 
 /* API properties */
 static enum whep_state state = 0;
@@ -91,6 +101,10 @@ static void whep_process_link_header(char *link);
 static gboolean whep_parse_sdp(char *sdp_object);
 static void whep_disconnect(char *reason);
 static void whep_incoming_stream(GstElement *webrtc, GstPad *pad, gpointer user_data);
+static gboolean whep_bus_watch(GstBus *bus, GstMessage *msg, gpointer user_data);
+static GstElement *whep_make_video_sink(void);
+static gboolean whep_reconnect(gpointer user_data);
+static void whep_teardown_and_reconnect(GstElement *old_pipeline, int delay_seconds);
 
 /* Helper struct to handle libsoup HTTP sessions */
 typedef struct whep_http_session {
@@ -109,9 +123,10 @@ static guint whep_http_send(whep_http_session *session, char *method,
 
 
 /* Signal handler */
-static volatile gint stop = 0, disconnected = 0;
+static volatile gint stop = 0, disconnected = 0, reconnecting = 0;
 static void whep_handle_signal(int signum) {
 	WHEP_LOG(LOG_INFO, "Stopping the WHEP client...\n");
+	g_atomic_int_set(&reconnecting, 0);
 	if(g_atomic_int_compare_and_exchange(&stop, 0, 1)) {
 		whep_disconnect("Shutting down");
 	} else {
@@ -138,6 +153,8 @@ static GOptionEntry opt_entries[] = {
 	{ "eos-sink-name", 'e', 0, G_OPTION_ARG_STRING, &eos_sink_name, "GStreamer sink name for EOS signal", NULL },
 	{ "jitter-buffer", 'b', 0, G_OPTION_ARG_INT, &latency, "Jitter buffer (latency) to use in RTP, in milliseconds (default: -1, use webrtcbin's default)", NULL },
 	{ "no-decode", 'N', 0, G_OPTION_ARG_NONE, &no_decode, "Don't decode and play received RTP streams (ignores incoming traffic)"},
+	{ "fullscreen", 'W', 0, G_OPTION_ARG_NONE, &fullscreen, "Display video fullscreen, auto-fitting to screen resolution (default: false)"},
+	{ "reconnect-delay", 'r', 0, G_OPTION_ARG_INT, &reconnect_delay, "Seconds to wait before reconnecting after a stream interruption (default: 5, 0 = disable auto-reconnect)"},
 	{ NULL },
 };
 
@@ -217,6 +234,11 @@ int main(int argc, char *argv[]) {
 	}
 	WHEP_LOG(LOG_INFO, "Audio caps: %s\n", audio_caps ? audio_caps : "(none)");
 	WHEP_LOG(LOG_INFO, "Video caps: %s\n", video_caps ? video_caps : "(none)");
+	WHEP_LOG(LOG_INFO, "Fullscreen: %s\n", fullscreen ? "yes" : "no");
+	if(reconnect_delay > 0)
+		WHEP_LOG(LOG_INFO, "Auto-reconnect: every %ds on stream interruption\n", reconnect_delay);
+	else
+		WHEP_LOG(LOG_INFO, "Auto-reconnect: disabled\n");
 	if(no_decode)
 		WHEP_LOG(LOG_WARN, "Ignoring incoming traffic (won't decode/play RTP streams)\n");
 	if(latency > 1000)
@@ -433,6 +455,14 @@ static gboolean whep_initialize(gboolean offer) {
 	WHEP_PREFIX(LOG_INFO, "Configured jitter-buffer size (latency) for PeerConnection to %ums\n", rtp_latency);
 	gst_object_unref(rtpbin);
 
+	/* If fullscreen is requested, attach a bus watch to send the
+	 * navigation event once the pipeline reaches PLAYING state */
+	if(fullscreen) {
+		GstBus *bus = gst_pipeline_get_bus(GST_PIPELINE(pipeline));
+		gst_bus_add_watch(bus, whep_bus_watch, NULL);
+		gst_object_unref(bus);
+	}
+
 	/* Start the pipeline */
 	gst_element_set_state(pipeline, GST_STATE_READY);
 
@@ -488,8 +518,10 @@ static void whep_offer_available(GstPromise *promise, gpointer user_data) {
 
 	/* Now that a DTLS stack is available, try monitoring the DTLS state too */
 	GstElement *dtls = gst_bin_get_by_name(GST_BIN(pc), "dtlsdec0");
-	g_signal_connect(dtls, "notify::connection-state", G_CALLBACK(whep_dtls_connection_state), NULL);
-	gst_object_unref(dtls);
+	if(dtls) {
+		g_signal_connect(dtls, "notify::connection-state", G_CALLBACK(whep_dtls_connection_state), NULL);
+		gst_object_unref(dtls);
+	}
 
 	/* Now that the offer is ready, connect to the WHEP endpoint and send it there
 	 * (unless we're not tricking, in which case we wait for gathering to be
@@ -521,8 +553,10 @@ static void whep_answer_available(GstPromise *promise, gpointer user_data) {
 
 	/* Now that a DTLS stack is available, try monitoring the DTLS state too */
 	GstElement *dtls = gst_bin_get_by_name(GST_BIN(pc), "dtlsdec0");
-	g_signal_connect(dtls, "notify::connection-state", G_CALLBACK(whep_dtls_connection_state), NULL);
-	gst_object_unref(dtls);
+	if(dtls) {
+		g_signal_connect(dtls, "notify::connection-state", G_CALLBACK(whep_dtls_connection_state), NULL);
+		gst_object_unref(dtls);
+	}
 
 	/* Now that the answer is ready, send it to the server via PATCH
 	 * (unless we're not tricking, in which case we wait for gathering to be
@@ -606,6 +640,9 @@ static gboolean whep_send_candidates(gpointer user_data) {
 /* Callback invoked when the connection state changes */
 static void whep_connection_state(GstElement *webrtc, GParamSpec *pspec,
 		gpointer user_data G_GNUC_UNUSED) {
+	/* Ignore callbacks from a previous pipeline that was torn down */
+	if(pipeline == NULL || webrtc != pc)
+		return;
 	guint state = 0;
 	g_object_get(webrtc, "connection-state", &state, NULL);
 	switch(state) {
@@ -631,6 +668,8 @@ static void whep_connection_state(GstElement *webrtc, GParamSpec *pspec,
 /* Callback invoked when the ICE gathering state changes */
 static void whep_ice_gathering_state(GstElement *webrtc, GParamSpec *pspec,
 		gpointer user_data G_GNUC_UNUSED) {
+	if(pipeline == NULL || webrtc != pc)
+		return;
 	guint state = 0;
 	g_object_get(webrtc, "ice-gathering-state", &state, NULL);
 	switch(state) {
@@ -663,6 +702,8 @@ static void whep_ice_gathering_state(GstElement *webrtc, GParamSpec *pspec,
 /* Callback invoked when the ICE connection state changes */
 static void whep_ice_connection_state(GstElement *webrtc, GParamSpec *pspec,
 		gpointer user_data G_GNUC_UNUSED) {
+	if(pipeline == NULL || webrtc != pc)
+		return;
 	guint state = 0;
 	g_object_get(webrtc, "ice-connection-state", &state, NULL);
 	switch(state) {
@@ -690,6 +731,8 @@ static void whep_ice_connection_state(GstElement *webrtc, GParamSpec *pspec,
 /* Callback invoked when the DTLS connection state changes */
 static void whep_dtls_connection_state(GstElement *dtls, GParamSpec *pspec,
 		gpointer user_data G_GNUC_UNUSED) {
+	if(pipeline == NULL)
+		return;
 	guint state = 0;
 	g_object_get(dtls, "connection-state", &state, NULL);
 	switch(state) {
@@ -956,7 +999,8 @@ static void whep_connect(GstWebRTCSessionDescription *offer) {
 	gst_webrtc_session_description_free(gst_sdp);
 
 	if(status == 201) {
-		/* Client-side offer, we're done */
+		/* Client-side offer accepted — connection established successfully */
+		g_atomic_int_set(&reconnecting, 0);
 		return;
 	}
 	/* If we got here, we're in server-sent offer mode, which means we
@@ -1039,32 +1083,145 @@ static void whep_answer(GstWebRTCSessionDescription *answer) {
 		latest_etag = g_strdup(etag);
 	}
 
-	/* Negotiation done */
+	/* Negotiation done — connection established successfully */
+	g_atomic_int_set(&reconnecting, 0);
 	WHEP_PREFIX(LOG_INFO, "Negotiation completed\n");
+}
+
+/* Pipeline teardown helper — runs in a worker thread so we never block
+ * the GLib main loop (which GStreamer also needs to process state changes). */
+static gpointer whep_pipeline_teardown_thread(gpointer user_data) {
+	GstElement *old_pipeline = (GstElement *)user_data;
+	gst_element_set_state(old_pipeline, GST_STATE_NULL);
+	/* Block here until GStreamer has actually reached NULL — safe because
+	 * we are NOT on the main loop thread. */
+	gst_element_get_state(old_pipeline, NULL, NULL, GST_CLOCK_TIME_NONE);
+	gst_object_unref(old_pipeline);
+	WHEP_PREFIX(LOG_INFO, "Old pipeline fully stopped\n");
+	return NULL;
+}
+
+/* Tear down a pipeline in a background thread, then schedule a reconnect.
+ * Pass delay_seconds=0 to tear down without scheduling a reconnect. */
+static void whep_teardown_and_reconnect(GstElement *old_pipeline, int delay_seconds) {
+	/* Spawn a thread to wait for NULL state, then post reconnect to main loop */
+	GThread *t = g_thread_try_new("pipeline-teardown",
+		whep_pipeline_teardown_thread, old_pipeline, NULL);
+	if(!t) {
+		/* Thread creation failed — best-effort synchronous teardown */
+		gst_element_set_state(old_pipeline, GST_STATE_NULL);
+		gst_object_unref(old_pipeline);
+	} else {
+		g_thread_unref(t);  /* detach — cleanup happens inside the thread */
+	}
+	if(delay_seconds > 0 && !g_atomic_int_get(&stop))
+		g_timeout_add_seconds(delay_seconds, whep_reconnect, NULL);
 }
 
 /* Helper method to disconnect from the WHEP endpoint */
 static void whep_disconnect(char *reason) {
+	/* If we're already in a reconnect attempt, this error came from the
+	 * new pipeline failing to connect (e.g. 404 while server is still down).
+	 * Tear down quietly and schedule the next retry. */
+	if(g_atomic_int_get(&reconnecting)) {
+		WHEP_LOG(LOG_WARN, "Reconnect attempt failed (%s), will retry in %ds...\n",
+			reason, reconnect_delay);
+		if(pipeline) {
+			GstElement *old = pipeline;
+			pc = NULL;
+			pipeline = NULL;
+			whep_teardown_and_reconnect(old, 0);
+		}
+		g_atomic_int_set(&disconnected, 0);
+		g_atomic_int_set(&reconnecting, 0);
+		g_timeout_add_seconds(reconnect_delay, whep_reconnect, NULL);
+		return;
+	}
+
+	/* Normal first disconnect — only handle once */
 	if(!g_atomic_int_compare_and_exchange(&disconnected, 0, 1))
 		return;
 	WHEP_PREFIX(LOG_INFO, "Disconnecting from server (%s)\n", reason);
-	if(resource_url == NULL) {
-		/* FIXME Nothing to do? */
+
+	/* Send a DELETE to the WHEP resource if we have one */
+	if(resource_url != NULL) {
+		whep_http_session session = { 0 };
+		guint status = whep_http_send(&session, "DELETE", resource_url, NULL, NULL, NULL);
+		if(status != 200) {
+			WHEP_LOG(LOG_WARN, " [%u] %s\n", status, status ? soup_message_get_reason_phrase(session.msg) : "HTTP error");
+		}
+		g_object_unref(session.msg);
+		g_object_unref(session.http_conn);
+	}
+
+	/* If the user explicitly stopped us (SIGINT/SIGTERM), quit for real */
+	if(g_atomic_int_get(&stop) || reconnect_delay <= 0) {
+		if(pipeline) {
+			gst_element_set_state(GST_ELEMENT(pipeline), GST_STATE_NULL);
+			gst_object_unref(pipeline);
+			pipeline = NULL;
+		}
 		g_main_loop_quit(loop);
 		return;
 	}
 
-	/* Create an HTTP connection */
-	whep_http_session session = { 0 };
-	guint status = whep_http_send(&session, "DELETE", resource_url, NULL, NULL, NULL);
-	if(status != 200) {
-		WHEP_LOG(LOG_WARN, " [%u] %s\n", status, status ? soup_message_get_reason_phrase(session.msg) : "HTTP error");
+	/* Tear down the pipeline in a background thread and schedule a reconnect */
+	WHEP_PREFIX(LOG_INFO, "Stream interrupted, reconnecting in %ds...\n", reconnect_delay);
+	if(pipeline) {
+		GstElement *old = pipeline;
+		pc = NULL;      /* null first so stale callbacks see pc==NULL and bail */
+		pipeline = NULL;
+		whep_teardown_and_reconnect(old, reconnect_delay);
+	} else {
+		g_timeout_add_seconds(reconnect_delay, whep_reconnect, NULL);
 	}
-	g_object_unref(session.msg);
-	g_object_unref(session.http_conn);
+}
 
-	/* Done */
-	g_main_loop_quit(loop);
+/* Reset all session state and attempt a fresh connection */
+static gboolean whep_reconnect(gpointer user_data G_GNUC_UNUSED) {
+	if(g_atomic_int_get(&stop))
+		return G_SOURCE_REMOVE;
+
+	WHEP_PREFIX(LOG_INFO, "Attempting to reconnect...\n");
+
+	/* Mark that we are inside a reconnect attempt so whep_disconnect
+	 * knows not to recurse if the new connection fails */
+	g_atomic_int_set(&reconnecting, 1);
+
+	/* Reset all per-session state so whep_initialize starts clean */
+	g_atomic_int_set(&disconnected, 0);
+	g_free(resource_url);	resource_url = NULL;
+	g_free(latest_etag);	latest_etag = NULL;
+	g_free(ice_ufrag);		ice_ufrag = NULL;
+	g_free(ice_pwd);		ice_pwd = NULL;
+	g_free(first_mid);		first_mid = NULL;
+	gathering_done = FALSE;
+	server_sent_offer = FALSE;
+	state = WHEP_STATE_DISCONNECTED;
+	whep_fullscreen_requested = FALSE;
+	whep_video_sink_ref = NULL;
+	if(candidates) {
+		g_async_queue_unref(candidates);
+		candidates = NULL;
+	}
+
+	/* Re-run STUN/TURN autoconfiguration if requested */
+	if(follow_link)
+		whep_options();
+
+	if(!whep_initialize(TRUE)) {
+		/* whep_initialize itself failed (not a connection error) — retry */
+		WHEP_LOG(LOG_WARN, "Reconnect failed, retrying in %ds...\n", reconnect_delay);
+		g_atomic_int_set(&reconnecting, 0);
+		g_timeout_add_seconds(reconnect_delay, whep_reconnect, NULL);
+		return G_SOURCE_REMOVE;
+	}
+
+	/* whep_initialize started the pipeline successfully. The actual WHEP
+	 * connection (HTTP POST) happens asynchronously in whep_connect — keep
+	 * reconnecting=1 until that succeeds, so any failure there is handled
+	 * correctly. It will be cleared in whep_connect on a 201 response. */
+	return G_SOURCE_REMOVE;
 }
 
 /* Static helper to autoaccept certificates */
@@ -1365,18 +1522,96 @@ static void whep_process_link_header(char *link) {
 	return;
 }
 
+/* Helper: create the best available video sink for the platform.
+ * On Raspberry Pi we try, in order:
+ *   1. xvimagesink  – reliable on RPi OS with X11
+ *   2. autovideosink – generic fallback
+ * When --fullscreen is active the window is resized to the full screen
+ * resolution using the X11 display size and GstVideoOverlay. */
+static GstElement *whep_make_video_sink(void) {
+	GstElement *sink = NULL;
+	const char *candidates[] = { "xvimagesink", "autovideosink", NULL };
+	int i;
+	for(i = 0; candidates[i] != NULL; i++) {
+		sink = gst_element_factory_make(candidates[i], NULL);
+		if(sink) {
+			WHEP_LOG(LOG_INFO, "Video sink: using '%s'\n", candidates[i]);
+			break;
+		}
+		WHEP_LOG(LOG_WARN, "Video sink '%s' not available, trying next...\n", candidates[i]);
+	}
+	if(!sink) {
+		WHEP_LOG(LOG_ERR, "No usable video sink found\n");
+		return NULL;
+	}
+	/* Keep pixel-aspect-ratio correct on all sinks that support it */
+	if(g_object_class_find_property(G_OBJECT_GET_CLASS(sink), "force-aspect-ratio"))
+		g_object_set(sink, "force-aspect-ratio", TRUE, NULL);
+	return sink;
+}
+
+/* Bus watch: once the pipeline reaches PLAYING and the sink window is
+ * realised, use GstVideoOverlay to resize it to the full screen size.
+ * We read the screen dimensions directly from X11 so no GTK is needed. */
+static gboolean whep_bus_watch(GstBus *bus G_GNUC_UNUSED, GstMessage *msg, gpointer user_data G_GNUC_UNUSED) {
+	if(!fullscreen || whep_fullscreen_requested || whep_video_sink_ref == NULL)
+		return TRUE;
+	/* Wait for the element (sink) to reach PLAYING — at that point the
+	 * underlying X window is realised and we can resize it. */
+	if(GST_MESSAGE_TYPE(msg) == GST_MESSAGE_STATE_CHANGED) {
+		GstState new_state;
+		gst_message_parse_state_changed(msg, NULL, &new_state, NULL);
+		if(new_state == GST_STATE_PLAYING &&
+				GST_MESSAGE_SRC(msg) == GST_OBJECT(whep_video_sink_ref)) {
+			/* Get screen dimensions from X11 */
+			int screen_w = 0, screen_h = 0;
+			const char *display_name = g_getenv("DISPLAY");
+			if(display_name == NULL)
+				display_name = ":0";
+			Display *xdisplay = XOpenDisplay(display_name);
+			if(xdisplay) {
+				int screen = DefaultScreen(xdisplay);
+				screen_w = DisplayWidth(xdisplay, screen);
+				screen_h = DisplayHeight(xdisplay, screen);
+				XCloseDisplay(xdisplay);
+				WHEP_LOG(LOG_INFO, "Fullscreen: screen size detected as %dx%d\n",
+					screen_w, screen_h);
+			} else {
+				WHEP_LOG(LOG_WARN, "Fullscreen: could not open X display, defaulting to 1920x1080\n");
+				screen_w = 1920;
+				screen_h = 1080;
+			}
+			/* Ask the sink to render into a rectangle covering the whole screen */
+			if(GST_IS_VIDEO_OVERLAY(whep_video_sink_ref)) {
+				gst_video_overlay_set_render_rectangle(
+					GST_VIDEO_OVERLAY(whep_video_sink_ref),
+					0, 0, screen_w, screen_h);
+				WHEP_LOG(LOG_INFO, "Fullscreen: overlay render rectangle set to %dx%d\n",
+					screen_w, screen_h);
+			}
+			whep_fullscreen_requested = TRUE;
+		}
+	}
+	return TRUE;
+}
+
 /* Callbacks invoked when we have a stream from an existing subscription */
 static void whep_handle_media_stream(GstPad *pad, gboolean video) {
 	/* Create the elements needed to play/render the stream */
 	GstElement *entry = gst_element_factory_make("queue", NULL);
 	GstElement *conv = gst_element_factory_make(video ? "videoconvert" : "audioconvert", NULL);
 	GstElement *resample = video ? NULL : gst_element_factory_make("audioresample", NULL);
-	GstElement *sink = gst_element_factory_make(video ? "autovideosink" : "autoaudiosink", NULL);
+	GstElement *sink = video ? whep_make_video_sink() : gst_element_factory_make("autoaudiosink", NULL);
+	if(!sink) {
+		WHEP_LOG(LOG_ERR, "Failed to create %s sink\n", video ? "video" : "audio");
+		return;
+	}
 	if(!video) {
 		/* This is audio */
 		gst_bin_add_many(GST_BIN(pipeline), entry, conv, resample, sink, NULL);
 	} else {
-		/* This is video */
+		/* This is video – keep a reference so the bus watch can fullscreen it */
+		whep_video_sink_ref = sink;
 		gst_bin_add_many(GST_BIN(pipeline), entry, conv, sink, NULL);
 	}
 	gst_element_sync_state_with_parent(entry);
