@@ -27,7 +27,7 @@ RUN apt-get update --allow-releaseinfo-change && \
 
 WORKDIR /opt
 
-RUN git clone https://github.com/meetecho/simple-whep-client.git && cd simple-whep-client && make
+RUN git clone https://github.com/hellzapop/simple-whep-client.git && cd simple-whep-client && make
 
 WORKDIR /opt/simple-whep-client
 
