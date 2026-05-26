@@ -46,6 +46,10 @@ Application Options:
   -L, --log-timestamps     Enable logging timestamps (default: disabled)
   -e, --eos-sink-name      GStreamer sink name for EOS signal
   -b, --jitter-buffer      Jitter buffer (latency) to use in RTP, in milliseconds (default: -1, use webrtcbin's default)
+
+  *** ADDONS ***
+  -W, --fullscreen         Set the application to fullscreen
+  -r, --reconnect-delay    Set the number of seconds to wait before trying to reconnect after disconnection
 ```
 
 # Testing the WHEP client
